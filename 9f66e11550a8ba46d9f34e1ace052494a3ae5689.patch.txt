@@ -1,0 +1,159 @@
+From 9f66e11550a8ba46d9f34e1ace052494a3ae5689 Mon Sep 17 00:00:00 2001
+From: Glenn 'devalias' Grant <glenn@devalias.net>
+Date: Tue, 3 Jan 2023 19:11:15 +1100
+Subject: [PATCH] add new cli command 'export-all' to export reminders as json
+
+---
+ Sources/RemindersLibrary/CLI.swift       |  13 +++
+ Sources/RemindersLibrary/Reminders.swift | 100 +++++++++++++++++++++++
+ 2 files changed, 113 insertions(+)
+
+diff --git a/Sources/RemindersLibrary/CLI.swift b/Sources/RemindersLibrary/CLI.swift
+index 3574ea0..bf0eac1 100644
+--- a/Sources/RemindersLibrary/CLI.swift
++++ b/Sources/RemindersLibrary/CLI.swift
+@@ -12,6 +12,18 @@ private struct ShowLists: ParsableCommand {
+     }
+ }
+ 
++private struct ExportAll: ParsableCommand {
++    static let configuration = CommandConfiguration(
++        abstract: "Export all reminders as JSON")
++
++    @Flag(help: "Pretty print the JSON data")
++    var prettyPrint = false
++
++    func run() {
++        reminders.exportAllReminders(prettyPrint: self.prettyPrint)
++    }
++}
++
+ private struct ShowAll: ParsableCommand {
+     static let configuration = CommandConfiguration(
+         abstract: "Print all reminders")
+@@ -197,6 +209,7 @@ public struct CLI: ParsableCommand {
+             ShowLists.self,
+             NewList.self,
+             ShowAll.self,
++            ExportAll.self,
+         ]
+     )
+ 
+diff --git a/Sources/RemindersLibrary/Reminders.swift b/Sources/RemindersLibrary/Reminders.swift
+index 552c2c3..2badfcc 100644
+--- a/Sources/RemindersLibrary/Reminders.swift
++++ b/Sources/RemindersLibrary/Reminders.swift
+@@ -16,6 +16,60 @@ private extension EKReminder {
+     }
+ }
+ 
++struct ReminderData: Encodable {
++    private enum CodingKeys: String, CodingKey {
++        case id
++        case calendarTitle
++        case title
++        case creationDate
++        case lastModifiedDate
++        case startDate
++        case dueDate
++        case notes
++        case priority
++        case isCompleted
++        case completionDate
++        case alarms
++        case recurrenceRules
++    }
++
++    let id: String
++    let calendarTitle: String?
++    let title: String?
++    let creationDate: Date?
++    let lastModifiedDate: Date?
++    let startDate: Date?
++    let dueDate: Date?
++    let notes: String?
++    let priority: Int
++    let isCompleted: Bool
++    let completionDate: Date?
++    let alarms: [EKAlarm]?
++    let recurrenceRules: [EKRecurrenceRule]?
++
++    public func encode(to encoder: Encoder) throws {
++        var container = encoder.container(keyedBy: CodingKeys.self)
++
++        try container.encode(id, forKey: .id)
++        try container.encode(calendarTitle, forKey: .calendarTitle)
++        try container.encode(title, forKey: .title)
++        try container.encode(creationDate.map { $0.formatted(Date.ISO8601FormatStyle()) }, forKey: .creationDate)
++        try container.encode(lastModifiedDate.map { $0.formatted(Date.ISO8601FormatStyle()) }, forKey: .lastModifiedDate)
++        try container.encode(startDate.map { $0.formatted(Date.ISO8601FormatStyle()) }, forKey: .startDate)
++        try container.encode(dueDate.map { $0.formatted(Date.ISO8601FormatStyle()) }, forKey: .dueDate)
++        try container.encode(notes, forKey: .notes)
++        try container.encode(priority, forKey: .priority)
++        try container.encode(isCompleted, forKey: .isCompleted)
++        try container.encode(completionDate.map { $0.formatted(Date.ISO8601FormatStyle()) }, forKey: .completionDate)
++        // TODO: error: referencing instance method 'encode(_:forKey:)' on 'Array' requires that 'EKAlarm' conform to 'Encodable'
++        //   Ref: https://developer.apple.com/documentation/eventkit/ekalarm
++        // try container.encode(alarms, forKey: .alarms)
++        // TODO: error: referencing instance method 'encode(_:forKey:)' on 'Array' requires that 'EKRecurrenceRule' conform to 'Encodable'
++        //   Ref: https://developer.apple.com/documentation/eventkit/ekrecurrencerule
++        // try container.encode(recurrenceRules, forKey: .recurrenceRules)
++    }
++}
++
+ private func format(_ reminder: EKReminder, at index: Int, listName: String? = nil) -> String {
+     let dateString = formattedDueDate(from: reminder).map { " (\($0))" } ?? ""
+     let priorityString = Priority(reminder.mappedPriority).map { " (priority: \($0))" } ?? ""
+@@ -79,6 +133,52 @@ public final class Reminders {
+         }
+     }
+ 
++    func exportAllReminders(prettyPrint: Bool) {
++        let semaphore = DispatchSemaphore(value: 0)
++        let encoder = JSONEncoder()
++
++        if prettyPrint {
++            encoder.outputFormatting = .prettyPrinted
++        }
++
++        self.reminders(on: self.getCalendars(), displayOptions: .incomplete) { reminders in
++            let remindersByCalendarTitle = Dictionary(grouping: reminders) { reminder -> String in
++                return reminder.calendar?.title ?? "Unknown"
++            }
++
++            let mappedRemindersByCalendarTitle = remindersByCalendarTitle.mapValues { values in
++                values.map { reminder -> ReminderData in
++                    return ReminderData(
++                        id: reminder.calendarItemIdentifier,
++                        calendarTitle: reminder.calendar?.title,
++                        title: reminder.title,
++                        creationDate: reminder.creationDate,
++                        lastModifiedDate: reminder.lastModifiedDate,
++                        startDate: reminder.startDateComponents?.date,
++                        dueDate: reminder.dueDateComponents?.date,
++                        notes: reminder.notes,
++                        priority: reminder.priority,
++                        isCompleted: reminder.isCompleted,
++                        completionDate: reminder.completionDate,
++                        alarms: reminder.alarms,
++                        recurrenceRules: reminder.recurrenceRules
++                    )
++                }
++            }
++
++            do {
++                let data = try encoder.encode(mappedRemindersByCalendarTitle)
++                FileHandle.standardOutput.write(data)
++            } catch {
++                print(error)
++            }
++
++            semaphore.signal()
++        }
++
++        semaphore.wait()
++    }
++
+     func showAllReminders(dueOn dueDate: DateComponents?) {
+         let semaphore = DispatchSemaphore(value: 0)
+         let calendar = Calendar.current
